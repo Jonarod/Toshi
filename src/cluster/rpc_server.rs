@@ -1,31 +1,23 @@
-use std::io::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use futures::Future;
-use hyper::client::connect::HttpConnector;
 use parking_lot::RwLock;
 use tantivy::schema::Schema;
-use tokio::net::TcpListener;
-use tokio::prelude::*;
-use tower::MakeService;
-use tower_buffer::Buffer;
-use tower_grpc::{BoxBody, Code, Request, Response, Status, Streaming};
-use tower_hyper::client::{Connect, ConnectError, Connection};
-use tower_hyper::util::{Connector, Destination};
-use tower_hyper::Server;
-use tower_request_modifier::{Builder, RequestModifier};
+
+use tonic::{ Code, Request, Response, Status, Streaming};
+use tonic::transport::Channel;
 use tracing::*;
 
 use toshi_proto::cluster_rpc::*;
+use toshi_proto::cluster_rpc::server::*;
+use toshi_proto::cluster_rpc::client::*;
 
 use crate::handle::IndexHandle;
 use crate::handlers::index::{AddDocument, DeleteDoc};
 use crate::index::IndexCatalog;
 use crate::query::Search;
 
-pub type Buf = Buffer<RequestModifier<Connection<BoxBody>, BoxBody>, http::Request<BoxBody>>;
-pub type RpcClient = client::IndexService<Buf>;
+pub type RpcClient = IndexServiceClient<Channel>;
 
 /// RPC Services should "ideally" work on only local indexes, they shouldn't be responsible for
 /// going to other nodes to get index data. It should be the master's duty to know where the local
@@ -43,36 +35,16 @@ impl Clone for RpcServer {
 }
 
 impl RpcServer {
-    pub fn serve(addr: SocketAddr, catalog: Arc<RwLock<IndexCatalog>>) -> impl Future<Item = (), Error = ()> {
-        let service = server::IndexServiceServer::new(RpcServer { catalog });
+    pub async fn serve(addr: SocketAddr, catalog: Arc<RwLock<IndexCatalog>>) -> Result<(), tonic::transport::Error> {
+        let service = IndexServiceServer::new(RpcServer { catalog });
         info!("Binding on port: {:?}", addr);
-        let bind = TcpListener::bind(&addr).unwrap_or_else(|_| panic!("Failed to bind to host: {:?}", addr));
-
-        info!("Bound to: {:?}", &bind.local_addr().unwrap());
-        let mut hyp = Server::new(service);
-
-        bind.incoming()
-            .for_each(move |sock| {
-                info!("Connection from: {:?}", sock.local_addr().unwrap());
-                let req = hyp.serve(sock).map_err(|err| error!("hyper error: {:?}", err));
-                tokio::spawn(req);
-                Ok(())
-            })
-            .map_err(|err| error!("Server Error: {:?}", err))
+        tonic::transport::Server::builder().serve(addr, service).await
     }
 
     //TODO: Make DNS Threads and Buffer Requests Configurable options
-    pub fn create_client(uri: http::Uri) -> impl Future<Item = RpcClient, Error = ConnectError<Error>> {
+    pub fn create_client(uri: http::Uri) -> Result<RpcClient, tonic::transport::Error> {
         info!("Creating Client to: {:?}", uri);
-        let dst = Destination::try_from_uri(uri.clone()).unwrap();
-        let connector = Connector::new(HttpConnector::new(num_cpus::get()));
-        let mut connect = Connect::new(connector);
-
-        connect.make_service(dst).map(move |c| {
-            let connection = Builder::new().set_origin(uri).build(c).unwrap();
-            let buffer = Buffer::new(connection, 128);
-            client::IndexService::new(buffer)
-        })
+        IndexServiceClient::connect(uri)
     }
 
     pub fn ok_result() -> ResultReply {
@@ -87,34 +59,26 @@ impl RpcServer {
         SearchReply { result, doc }
     }
 
-    pub fn error_response<T>(code: Code, msg: String) -> Box<future::FutureResult<Response<T>, Status>> {
+    pub fn error_response<T>(code: Code, msg: String) -> Result<Response<T>, Status> {
         let status = Status::new(code, msg);
-        Box::new(future::failed(status))
+        Err(status)
     }
 }
 
+#[tonic::async_trait]
 impl server::IndexService for RpcServer {
-    type PingFuture = Box<future::FutureResult<Response<PingReply>, Status>>;
-    type ListIndexesFuture = Box<future::FutureResult<Response<ListReply>, Status>>;
-    type PlaceIndexFuture = Box<future::FutureResult<Response<ResultReply>, Status>>;
-    type PlaceDocumentFuture = Box<future::FutureResult<Response<ResultReply>, Status>>;
-    type PlaceReplicaFuture = Box<future::FutureResult<Response<ResultReply>, Status>>;
-    type SearchIndexFuture = Box<future::FutureResult<Response<SearchReply>, Status>>;
-    type DeleteDocumentFuture = Box<future::FutureResult<Response<ResultReply>, Status>>;
-    type GetSummaryFuture = Box<future::FutureResult<Response<SummaryReply>, Status>>;
-    type BulkInsertFuture = Box<future::FutureResult<Response<ResultReply>, Status>>;
 
-    fn list_indexes(&mut self, req: Request<ListRequest>) -> Self::ListIndexesFuture {
+    async fn list_indexes(&self, req: Request<ListRequest>) -> Result<Response<ListReply>, tonic::Status> {
         let cat = self.catalog.read();
         info!("Request From: {:?}", req);
         let indexes = cat.get_collection();
         let lists: Vec<String> = indexes.into_iter().map(|(t, _)| t.to_string()).collect();
         info!("Response: {:?}", lists.join(", "));
         let resp = Response::new(ListReply { indexes: lists });
-        Box::new(future::finished(resp))
+        Ok(resp)
     }
 
-    fn search_index(&mut self, request: Request<SearchRequest>) -> Self::SearchIndexFuture {
+    async fn search_index(&self, request: Request<SearchRequest>) ->  Result<Response<SearchReply>, tonic::Status> {
         let inner = request.into_inner();
         let cat = self.catalog.read();
         if let Ok(index) = cat.get_index(&inner.index) {
@@ -129,12 +93,12 @@ impl server::IndexService for RpcServer {
                     info!("Query Response = {:?} hits", query_results.hits);
                     let query_bytes: Vec<u8> = serde_json::to_vec(&query_results).unwrap();
                     let result = Some(RpcServer::ok_result());
-                    Box::new(future::finished(Response::new(RpcServer::create_search_reply(result, query_bytes))))
+                    Ok(Response::new(RpcServer::create_search_reply(result, query_bytes)))
                 }
                 Err(e) => {
                     info!("Query Response = {:?}", e);
                     let result = Some(RpcServer::create_result(1, e.to_string()));
-                    Box::new(future::finished(Response::new(RpcServer::create_search_reply(result, vec![]))))
+                    Ok(Response::new(RpcServer::create_search_reply(result, vec![])))
                 }
             }
         } else {
@@ -142,14 +106,14 @@ impl server::IndexService for RpcServer {
         }
     }
 
-    fn place_index(&mut self, request: Request<PlaceRequest>) -> Self::PlaceIndexFuture {
+    async fn place_index(&self, request: Request<PlaceRequest>) ->  Result<Response<ResultReply>, tonic::Status> {
         let PlaceRequest { index, schema } = request.into_inner();
         let mut cat = self.catalog.write();
         if let Ok(schema) = serde_json::from_slice::<Schema>(&schema) {
             let ip = cat.base_path().clone();
             if let Ok(new_index) = IndexCatalog::create_from_managed(ip, &index.clone(), schema) {
                 if cat.add_index(index.clone(), new_index).is_ok() {
-                    Box::new(future::finished(Response::new(RpcServer::ok_result())))
+                    Ok(Response::new(RpcServer::ok_result()))
                 } else {
                     Self::error_response(Code::Internal, format!("Insert: {} failed", index.clone()))
                 }
@@ -161,13 +125,13 @@ impl server::IndexService for RpcServer {
         }
     }
 
-    fn place_document(&mut self, request: Request<DocumentRequest>) -> Self::PlaceDocumentFuture {
+   async fn place_document(&self, request: Request<DocumentRequest>) ->  Result<Response<ResultReply>, tonic::Status> {
         let DocumentRequest { index, document } = request.into_inner();
         let cat = self.catalog.read();
         if let Ok(idx) = cat.get_index(&index) {
             if let Ok(doc) = serde_json::from_slice::<AddDocument>(&document) {
                 if idx.add_document(doc).is_ok() {
-                    Box::new(future::finished(Response::new(RpcServer::ok_result())))
+                    Ok(Response::new(RpcServer::ok_result()))
                 } else {
                     Self::error_response(Code::Internal, format!("Add Document Failed: {}", index))
                 }
@@ -179,17 +143,13 @@ impl server::IndexService for RpcServer {
         }
     }
 
-    fn place_replica(&mut self, _request: Request<ReplicaRequest>) -> Self::PlaceReplicaFuture {
-        unimplemented!()
-    }
-
-    fn delete_document(&mut self, request: Request<DeleteRequest>) -> Self::DeleteDocumentFuture {
+    async fn delete_document(&self, request: Request<DeleteRequest>) ->  Result<Response<ResultReply>, tonic::Status> {
         let DeleteRequest { index, terms } = request.into_inner();
         let cat = self.catalog.read();
         if let Ok(idx) = cat.get_index(&index) {
             if let Ok(delete_docs) = serde_json::from_slice::<DeleteDoc>(&terms) {
                 if idx.delete_term(delete_docs).is_ok() {
-                    Box::new(future::finished(Response::new(RpcServer::ok_result())))
+                    Ok(Response::new(RpcServer::ok_result()))
                 } else {
                     Self::error_response(Code::Internal, format!("Add Document Failed: {}", index))
                 }
@@ -201,12 +161,12 @@ impl server::IndexService for RpcServer {
         }
     }
 
-    fn get_summary(&mut self, request: Request<SummaryRequest>) -> Self::GetSummaryFuture {
+    async fn get_summary(&self, request: Request<SummaryRequest>) ->  Result<Response<SummaryReply>, tonic::Status> {
         let SummaryRequest { index } = request.into_inner();
         if let Ok(idx) = self.catalog.read().get_index(&index) {
             if let Ok(metas) = idx.get_index().load_metas() {
                 let meta_json = serde_json::to_vec(&metas).unwrap();
-                Box::new(future::ok(Response::new(SummaryReply { summary: meta_json })))
+                Ok(Response::new(SummaryReply { summary: meta_json }))
             } else {
                 Self::error_response(Code::DataLoss, format!("Could not load metas for: {}", index))
             }
@@ -215,12 +175,12 @@ impl server::IndexService for RpcServer {
         }
     }
 
-    fn bulk_insert(&mut self, _: Request<Streaming<BulkRequest>>) -> Self::BulkInsertFuture {
+    async fn bulk_insert(&self, _: Request<Streaming<BulkRequest>>) -> Result<Response<ResultReply>, tonic::Status> {
         unimplemented!()
     }
 
-    fn ping(&mut self, _: Request<PingRequest>) -> Self::PingFuture {
-        Box::new(future::ok(Response::new(PingReply { status: "OK".into() })))
+    async fn ping(&self, _: Request<PingRequest>) -> Result<Response<PingReply>, tonic::Status> {
+        Ok(Response::new(PingReply { status: "OK".into() }))
     }
 }
 

@@ -1,22 +1,24 @@
 use std::hash::{Hash, Hasher};
+use std::iter::Iterator;
 
 use rand::prelude::*;
-use tokio::prelude::*;
-use tower_grpc::{Request as TowerRequest, Response};
+use tonic::{Request as TowerRequest, Response};
 use tracing::*;
 
-use toshi_proto::cluster_rpc::{DeleteRequest, DocumentRequest, SearchReply, SearchRequest};
+use async_trait::async_trait;
+use toshi_proto::cluster_rpc::{DeleteRequest, DocumentRequest, ResultReply, SearchRequest};
 
 use crate::cluster::rpc_server::RpcClient;
 use crate::cluster::RPCError;
-use crate::handle::{IndexHandle, IndexLocation};
-use crate::handlers::index::{AddDocument, DeleteDoc};
+use crate::error::Error;
+use crate::handle::{IndexHandle, IndexLocation, AsyncHandle};
+use crate::handlers::index::{AddDocument, DeleteDoc, DocsAffected};
 use crate::query::Search;
+use crate::results::SearchResults;
 
 /// A reference to an index stored somewhere else on the cluster, this operates via calling
 /// the remote host and full filling the request via rpc, we need to figure out a better way
 /// (tower-buffer) on how to keep these clients.
-
 #[derive(Clone)]
 pub struct RemoteIndex {
     name: String,
@@ -47,24 +49,15 @@ impl RemoteIndex {
     }
 }
 
-impl IndexHandle for RemoteIndex {
-    type SearchResponse = Box<dyn Future<Item = Vec<SearchReply>, Error = RPCError> + Send>;
-    type DeleteResponse = Box<dyn Future<Item = Vec<i32>, Error = RPCError> + Send>;
-    type AddResponse = Box<dyn Future<Item = Vec<i32>, Error = RPCError> + Send>;
+#[async_trait]
+impl AsyncHandle for RemoteIndex {
 
-    fn get_name(&self) -> String {
-        self.name.clone()
-    }
-
-    fn index_location(&self) -> IndexLocation {
-        IndexLocation::REMOTE
-    }
-
-    fn search_index(&self, search: Search) -> Self::SearchResponse {
+    async fn search_index(&self, search: Search) -> Result<SearchResults, Error> {
         let name = self.name.clone();
         let clients = self.remotes.clone();
         info!("REQ = {:?}", search);
-        let fut = clients.into_iter().map(move |mut client| {
+        let mut results = SearchResults::new(vec![]);
+        for mut client in clients {
             let bytes = match serde_json::to_vec(&search) {
                 Ok(v) => v,
                 Err(_) => Vec::new(),
@@ -73,48 +66,49 @@ impl IndexHandle for RemoteIndex {
                 index: name.clone(),
                 query: bytes,
             });
-            client.search_index(req).map(Response::into_inner).map_err(|e| {
-                info!("ERR = {:?}", e);
-                e.into()
-            })
-        });
+            let node_results = client.search_index(req).await?.into_inner();
+            let search_results: SearchResults = serde_json::from_slice(&node_results.doc).unwrap();
+            results = results + search_results;
+//            results.push(search_results);
+        }
 
-        Box::new(future::join_all(fut))
+        Ok(results)
     }
 
-    fn add_document(&self, add: AddDocument) -> Self::AddResponse {
+    async fn add_document(&self, add: AddDocument) -> Result<(), Error> {
         let name = self.name.clone();
         let clients = self.remotes.clone();
         info!("REQ = {:?}", add);
-        let mut random = thread_rng();
-        let fut = clients.into_iter().choose(&mut random).map(move |mut client| {
-            let bytes = match serde_json::to_vec(&add) {
-                Ok(v) => v,
-                Err(_) => Vec::new(),
-            };
-            let req = TowerRequest::new(DocumentRequest {
-                index: name,
-                document: bytes,
-            });
-            client
-                .place_document(req)
-                .map(|res| {
-                    info!("RESPONSE = {:?}", res);
-                    res.into_inner().code
-                })
-                .map_err(|e| {
-                    info!("ERR = {:?}", e);
-                    e.into()
-                })
+        let mut random = rand::rngs::SmallRng::from_entropy();
+        let mut client = clients.into_iter().choose(&mut random).unwrap();
+        let bytes = match serde_json::to_vec(&add) {
+            Ok(v) => v,
+            Err(_) => Vec::new(),
+        };
+        let req = TowerRequest::new(DocumentRequest {
+            index: name,
+            document: bytes,
         });
+        let req: Result<Response<ResultReply>, RPCError> = client.place_document(req).await
+            .map_err(|e| {
+                info!("ERR = {:?}", e);
+                e.into()
+            });
 
-        Box::new(future::join_all(fut))
+
+//        info!("RESPONSE = {:?}", req?.into_inner());
+
+
+        Ok(())
     }
 
-    fn delete_term(&self, delete: DeleteDoc) -> Self::DeleteResponse {
+   async fn delete_term(&self, delete: DeleteDoc) -> Result<DocsAffected, Error> {
         let name = self.name.clone();
         let clients = self.remotes.clone();
-        let fut = clients.into_iter().map(move |mut client| {
+
+        let mut results = 0u64;
+
+        for mut client in clients {
             let bytes = match serde_json::to_vec(&delete) {
                 Ok(v) => v,
                 Err(_) => Vec::new(),
@@ -123,18 +117,14 @@ impl IndexHandle for RemoteIndex {
                 index: name.clone(),
                 terms: bytes,
             });
-            client
-                .delete_document(req)
-                .map(|res| {
-                    info!("RESPONSE = {:?}", res);
-                    res.into_inner().code
-                })
+            let result: Result<Response<ResultReply>, RPCError> = client.delete_document(req).await
                 .map_err(|e| {
                     info!("ERR = {:?}", e);
                     e.into()
-                })
-        });
+                });
+            results += result?.into_inner().code as u64;
+        }
 
-        Box::new(future::join_all(fut))
+        Ok(DocsAffected { docs_affected: results })
     }
 }

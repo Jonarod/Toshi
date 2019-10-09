@@ -8,9 +8,10 @@ license = "MIT"
 edition = "2018"
 
 [dependencies]
-hyper = "^0.12"
+hyper = "^0.13.0-alpha"
 http = "^0.1"
-futures = "^0.1"
-tokio = "^0.1"
+futures-preview = "0.3.0-alpha"
+async-trait = "0.1.13"
+tokio = "^0.2.0-alpha"
 failure = "^0.1"
 tracing = "^0.1"

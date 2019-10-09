@@ -4,28 +4,27 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use futures::stream::Stream;
+use async_stream::stream;
 use hashbrown::HashMap;
-use http::uri::Scheme;
 use http::Uri;
+use http::uri::Scheme;
 use parking_lot::{Mutex, RwLock};
 use tantivy::directory::MmapDirectory;
-use tantivy::schema::Schema;
 use tantivy::Index;
+use tantivy::schema::Schema;
 use tokio::prelude::*;
 
 use toshi_proto::cluster_rpc::*;
 
 use crate::cluster::remote_handle::RemoteIndex;
 use crate::cluster::rpc_server::{RpcClient, RpcServer};
-use crate::cluster::RPCError;
 use crate::error::Error;
-use crate::handle::{IndexHandle, LocalIndex};
-use crate::handlers::index::{AddDocument, DeleteDoc};
+use crate::handle::{AsyncHandle, IndexHandle, LocalIndex};
+use crate::handlers::index::{AddDocument, DeleteDoc, DocsAffected};
 use crate::query::Search;
+use crate::Result;
 use crate::results::*;
 use crate::settings::Settings;
-use crate::Result;
 
 pub type SharedCatalog = Arc<RwLock<IndexCatalog>>;
 
@@ -56,18 +55,18 @@ impl IndexCatalog {
         Ok(index_cat)
     }
 
-    pub fn update_remote_indexes(&self) -> impl Future<Item = (), Error = ()> {
-        let cat_clone = Arc::clone(&self.remote_handles);
-        IndexCatalog::refresh_multiple_nodes(self.settings.experimental_features.nodes.clone())
-            .for_each(move |indexes| {
-                let cat = &cat_clone;
-                for idx in indexes.1 {
-                    let ri = RemoteIndex::new(idx.clone(), indexes.0.clone());
-                    cat.lock().insert(idx.clone(), ri);
-                }
-                future::ok(())
-            })
-            .map_err(|e| panic!("{:?}", e))
+    pub async fn update_remote_indexes(&self) -> Result<()> {
+        let cat = Arc::clone(&self.remote_handles);
+        let indexes = IndexCatalog::refresh_multiple_nodes(self.settings.experimental_features.nodes.clone());
+
+        futures::pin_mut!(indexes);
+        while let Some((c, idx)) = indexes.next().await {
+            for i in idx {
+                let ri = RemoteIndex::new(i.clone(), c.clone());
+                cat.lock().insert(i.clone(), ri);
+            }
+        }
+        Ok(())
     }
 
     pub fn base_path(&self) -> &PathBuf {
@@ -199,68 +198,55 @@ impl IndexCatalog {
             .map_err(|e| Error::IOError(e.to_string()))
     }
 
-    pub fn create_client(node: String) -> impl Future<Item = RpcClient, Error = RPCError> + Send {
+    pub fn create_client(node: String) -> Result<RpcClient> {
         let socket: SocketAddr = node.parse().unwrap();
         let host_uri = IndexCatalog::create_host_uri(socket).unwrap();
         RpcServer::create_client(host_uri).map_err(Into::into)
     }
 
-    pub fn refresh_multiple_nodes(nodes: Vec<String>) -> impl stream::Stream<Item = (RpcClient, Vec<String>), Error = RPCError> {
-        let n = nodes.iter().map(|n| IndexCatalog::refresh_remote_catalog(n.to_owned()));
-        stream::futures_unordered(n)
+    pub fn refresh_multiple_nodes(nodes: Vec<String>) -> impl Stream<Item=(RpcClient, Vec<String>)> {
+        stream! {
+            for node in nodes.iter() {
+               yield IndexCatalog::refresh_remote_catalog(node.to_owned()).await.unwrap();
+            }
+        }
     }
 
-    pub fn refresh_remote_catalog(node: String) -> impl Future<Item = (RpcClient, Vec<String>), Error = RPCError> + Send {
-        IndexCatalog::create_client(node)
-            .and_then(|mut client| {
-                let client_clone = client.clone();
-                client
-                    .list_indexes(tower_grpc::Request::new(ListRequest {}))
-                    .map(|resp| (client_clone, resp.into_inner()))
-                    .map_err(Into::into)
-            })
+    pub async fn refresh_remote_catalog(node: String) -> Result<(RpcClient, Vec<String>)> {
+        let mut client = IndexCatalog::create_client(node)?;
+        client.list_indexes(tonic::Request::new(ListRequest {})).await
+            .map(|resp| (client.clone(), resp.into_inner()))
+            .map_err(Into::into)
             .map(move |(x, r)| (x, r.indexes))
     }
 
-    pub fn search_local_index(&self, index: &str, search: Search) -> impl Future<Item = Vec<SearchResults>, Error = Error> + Send {
-        self.get_index(index)
-            .and_then(move |hand| hand.search_index(search).map(|r| vec![r]))
-            .into_future()
+    pub async fn search_local_index(&self, index: &str, search: Search) -> Result<SearchResults> {
+        if let Ok(idx) = self.get_index(index) {
+            let s = idx.search_index(search)?;
+            Ok(s)
+        } else {
+            Ok(SearchResults::new(vec![]))
+        }
     }
 
-    pub fn search_remote_index(&self, index: &str, search: Search) -> impl Future<Item = Vec<SearchResults>, Error = Error> + Send {
-        self.get_remote_index(index).into_future().and_then(move |hand| {
-            hand.search_index(search)
-                .and_then(|sr| {
-                    let doc: Vec<SearchResults> = sr.iter().map(|r| serde_json::from_slice(&r.doc).unwrap()).collect();
-                    Ok(doc)
-                })
-                .map_err(|_| Error::IOError("An error occurred with the query".into()))
-        })
+    pub async fn search_remote_index(&self, index: &str, search: Search) -> Result<SearchResults> {
+        let remote = self.get_remote_index(index)?;
+        remote.search_index(search).await
     }
 
-    pub fn add_remote_document(&self, index: &str, doc: AddDocument) -> impl Future<Item = (), Error = Error> + Send {
-        self.get_remote_index(index)
-            .into_future()
-            .and_then(move |hand| {
-                hand.add_document(doc)
-                    .map_err(|_| Error::IOError("An error occurred with the query".into()))
-            })
-            .map(|_| ())
+    pub async fn add_remote_document(&self, index: &str, doc: AddDocument) -> Result<()> {
+        let hand = self.get_remote_index(index)?;
+        hand.add_document(doc).await
     }
 
-    pub fn add_local_document(&self, index: &str, doc: AddDocument) -> impl Future<Item = (), Error = Error> + Send {
-        self.get_owned_index(index)
-            .into_future()
-            .and_then(move |hand| hand.add_document(doc))
-            .map(|_| ())
+    pub fn add_local_document(&self, index: &str, doc: AddDocument) -> Result<()> {
+        let hand = self.get_owned_index(index)?;
+        hand.add_document(doc)
     }
 
-    pub fn delete_local_term(&self, index: &str, term: DeleteDoc) -> impl Future<Item = (), Error = Error> + Send {
-        self.get_remote_index(index)
-            .into_future()
-            .and_then(move |handle| handle.delete_term(term).from_err())
-            .map(|_| ())
+    pub fn delete_local_term(&self, index: &str, term: DeleteDoc) -> Result<DocsAffected> {
+        let hand = self.get_owned_index(index)?;
+        hand.delete_term(term)
     }
 
     pub fn clear(&mut self) {
@@ -297,11 +283,11 @@ pub mod tests {
         let idx = Index::create_in_ram(schema);
         let mut writer = idx.writer(30_000_000).unwrap();
 
-        writer.add_document(doc! { test_text => "Test Document 1", test_int => 2014i64,  test_unsign => 10u64, test_unindexed => "no", test_facet => Facet::from("/cat/cat2") });
-        writer.add_document(doc! { test_text => "Test Dockument 2", test_int => -2015i64, test_unsign => 11u64, test_unindexed => "yes", test_facet => Facet::from("/cat/cat2") });
-        writer.add_document(doc! { test_text => "Test Duckiment 3", test_int => 2016i64,  test_unsign => 12u64, test_unindexed => "noo", test_facet => Facet::from("/cat/cat3") });
-        writer.add_document(doc! { test_text => "Test Document 4", test_int => -2017i64, test_unsign => 13u64, test_unindexed => "yess", test_facet => Facet::from("/cat/cat4") });
-        writer.add_document(doc! { test_text => "Test Document 5", test_int => 2018i64,  test_unsign => 14u64, test_unindexed => "nooo", test_facet => Facet::from("/dog/cat2") });
+        writer.add_document(doc! { test_text => "Test Document 1", test_int => 2014i64, test_unsign => 10u64, test_unindexed => "no", test_facet => Facet::from("/cat/cat2") });
+        writer.add_document(doc! { test_text => "Test Dockument 2", test_int => - 2015i64, test_unsign => 11u64, test_unindexed => "yes", test_facet => Facet::from("/cat/cat2") });
+        writer.add_document(doc! { test_text => "Test Duckiment 3", test_int => 2016i64, test_unsign => 12u64, test_unindexed => "noo", test_facet => Facet::from("/cat/cat3") });
+        writer.add_document(doc! { test_text => "Test Document 4", test_int => - 2017i64, test_unsign => 13u64, test_unindexed => "yess", test_facet => Facet::from("/cat/cat4") });
+        writer.add_document(doc! { test_text => "Test Document 5", test_int => 2018i64, test_unsign => 14u64, test_unindexed => "nooo", test_facet => Facet::from("/dog/cat2") });
         writer.commit().unwrap();
 
         idx

@@ -7,6 +7,7 @@ use tantivy::TantivyError;
 
 use crate::cluster::RPCError;
 use crate::results::ErrorResponse;
+use tonic::Status;
 
 #[derive(Debug, Fail, Serialize, Deserialize)]
 pub enum Error {
@@ -81,12 +82,6 @@ impl<T> From<std::sync::PoisonError<T>> for Error {
     }
 }
 
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Self {
-        Error::IOError(err.to_string())
-    }
-}
-
 impl From<std::str::Utf8Error> for Error {
     fn from(err: std::str::Utf8Error) -> Self {
         Error::IOError(err.to_string())
@@ -113,6 +108,24 @@ impl From<crossbeam::channel::SendError<bytes::Bytes>> for Error {
 
 impl From<RPCError> for Error {
     fn from(err: RPCError) -> Self {
+        Error::IOError(err.to_string())
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::IOError(err.to_string())
+    }
+}
+
+impl From<Status> for Error {
+    fn from(err: Status) -> Self {
+        Error::IOError(err.to_string())
+    }
+}
+
+impl From<tonic::transport::Error> for Error {
+    fn from(err: tonic::transport::Error) -> Self {
         Error::IOError(err.to_string())
     }
 }

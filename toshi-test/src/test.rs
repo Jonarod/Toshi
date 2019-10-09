@@ -1,18 +1,19 @@
 use std::fmt;
 use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
-use failure::format_err;
-use futures::{future, Future, Stream};
+use failure::{Error, format_err};
+use futures::{Future, TryFutureExt, TryStreamExt, FutureExt};
 use http::HttpTryFrom;
-use hyper::client::{connect::Connect, Client};
-use hyper::header::{HeaderValue, IntoHeaderName};
 use hyper::{Body, Method, Request, Response, Uri};
-use tokio::timer::Delay;
+use hyper::client::{Client, connect::Connect};
+use hyper::header::{HeaderValue, IntoHeaderName};
+use tokio::runtime::Runtime;
+use tokio::timer::Timeout;
 use tracing::warn;
 
-use crate::{Result, CONTENT_TYPE};
-use std::sync::{Arc, RwLock};
-use tokio::runtime::Runtime;
+use crate::{CONTENT_TYPE, Result};
 
 pub struct TestRequest<'a, C: Connect> {
     client: &'a TestClient<C>,
@@ -35,8 +36,8 @@ impl<'a, C: Connect> DerefMut for TestRequest<'a, C> {
 
 impl<'a, C: Connect + 'static> TestRequest<'a, C> {
     pub(crate) fn new<U>(client: &'a TestClient<C>, method: Method, uri: U) -> Self
-    where
-        Uri: HttpTryFrom<U>,
+        where
+            Uri: HttpTryFrom<U>,
     {
         TestRequest {
             client,
@@ -53,58 +54,39 @@ impl<'a, C: Connect + 'static> TestRequest<'a, C> {
     }
 
     pub fn with_header<N>(mut self, name: N, value: HeaderValue) -> Self
-    where
-        N: IntoHeaderName,
+        where
+            N: IntoHeaderName,
     {
         self.headers_mut().insert(name, value);
         self
     }
 }
 
+#[async_trait::async_trait]
 pub(crate) trait BodyReader {
-    fn read_body(&mut self, response: Response<Body>) -> Result<Vec<u8>>;
+    async fn read_body(&mut self, response: Response<Body>) -> Result<Vec<u8>>;
 }
 
 pub trait Server: Clone {
     fn run_future<F, R, E>(&self, future: F) -> Result<R>
-    where
-        F: Send + 'static + Future<Item = R, Error = E>,
-        R: Send + 'static,
-        E: failure::Fail;
+        where
+            F: Send + Unpin + 'static + Future<Output=Result<R>>,
+            R: Send + 'static,
+            E: failure::Fail;
 
-    fn request_expiry(&self) -> Delay;
+    fn request_expiry(&self) -> Instant;
 
-    fn run_request<F>(&self, f: F) -> Result<F::Item>
-    where
-        F: Future + Send + 'static,
-        F::Error: failure::Fail + Sized,
-        F::Item: Send,
-    {
-        let might_expire = self.run_future(f.select2(self.request_expiry()).map_err(|either| {
-            let e: failure::Error = match either {
-                future::Either::A((req_err, _)) => {
-                    warn!("run_request request error: {:?}", req_err);
-                    req_err.into()
-                }
-                future::Either::B((times_up, _)) => {
-                    warn!("run_request timed out");
-                    times_up.into()
-                }
-            };
-            e.compat()
-        }))?;
-
-        match might_expire {
-            future::Either::A((item, _)) => Ok(item),
-            future::Either::B(_) => Err(failure::err_msg("Timeout")),
-        }
-    }
+    fn run_request<F, R, E>(&self, f: F) -> Result<R>
+        where
+            F: Send + Unpin + 'static + Future<Output=Result<R>>,
+            R: Send + 'static,
+            E: failure::Fail;
 }
 
-impl<T: Server> BodyReader for T {
-    fn read_body(&mut self, response: Response<Body>) -> Result<Vec<u8>> {
-        let f = response.into_body().concat2().map(|chunk| chunk.into_iter().collect());
-        self.run_future(f)
+#[async_trait::async_trait]
+impl<T: Server + Send> BodyReader for T {
+    async fn read_body(&mut self, response: Response<Body>) -> Result<Vec<u8>> {
+        response.into_body().try_concat().map_ok(|c| c.to_vec()).map_err(|e| Error::from(e)).await
     }
 }
 
@@ -115,39 +97,39 @@ pub struct TestClient<C: Connect> {
 
 impl<C: Connect + 'static> TestClient<C> {
     pub fn get<U>(&self, uri: U) -> TestRequest<C>
-    where
-        Uri: HttpTryFrom<U>,
+        where
+            Uri: HttpTryFrom<U>,
     {
         self.build_request(Method::GET, uri)
     }
 
     pub fn post<B, U>(&self, uri: U, body: B) -> TestRequest<C>
-    where
-        B: Into<Body>,
-        Uri: HttpTryFrom<U>,
+        where
+            B: Into<Body>,
+            Uri: HttpTryFrom<U>,
     {
         self.build_request_with_body(Method::POST, uri, body)
     }
 
     pub fn put<B, U>(&self, uri: U, body: B) -> TestRequest<C>
-    where
-        B: Into<Body>,
-        Uri: HttpTryFrom<U>,
+        where
+            B: Into<Body>,
+            Uri: HttpTryFrom<U>,
     {
         self.build_request_with_body(Method::PUT, uri, body)
     }
 
     pub fn build_request<U>(&self, method: Method, uri: U) -> TestRequest<C>
-    where
-        Uri: HttpTryFrom<U>,
+        where
+            Uri: HttpTryFrom<U>,
     {
         TestRequest::new(self, method, uri)
     }
 
     pub fn build_request_with_body<B, U>(&self, method: Method, uri: U, body: B) -> TestRequest<C>
-    where
-        B: Into<Body>,
-        Uri: HttpTryFrom<U>,
+        where
+            B: Into<Body>,
+            Uri: HttpTryFrom<U>,
     {
         let mut request = self.build_request(method, uri);
         {
@@ -165,13 +147,11 @@ impl<C: Connect + 'static> TestClient<C> {
             format_err!("request failed: {:?}", e).compat()
         });
 
-        let (tx, rx) = futures::sync::oneshot::channel();
         self.rt
             .write()
             .expect("???")
-            .spawn(req_future.then(move |r| tx.send(r).map_err(|_| unreachable!())));
-
-        rx.wait().unwrap().map_err(Into::into)
+            .block_on(req_future)
+            .map_err(|e| failure::Error::from(e))
     }
 }
 
@@ -200,8 +180,8 @@ impl fmt::Debug for TestResponse {
 }
 
 impl TestResponse {
-    pub fn read_utf8_body(self) -> Result<String> {
-        let buf = self.response.into_body().concat2().wait()?;
+    pub async fn read_utf8_body(self) -> Result<String> {
+        let buf = self.response.into_body().try_concat().await?;
         let s = String::from_utf8(buf.to_vec())?;
         Ok(s)
     }

@@ -18,19 +18,14 @@ members = [ "./", "toshi-proto", "toshi-test" ]
 
 [dependencies]
 toshi-proto            = { path = "toshi-proto" }
-tower                  = "^0.1"
-tower-buffer           = "^0.1"
-tower-hyper            = "^0.1"
-tower-request-modifier = "^0.1"
 http                   = "^0.1"
 bytes                  = "^0.4"
-hyper                  = "^0.12"
+hyper                  = { version = "^0.13.0-alpha", features = ["unstable-stream"] }
 serde_json             = "^1.0"
 serde_urlencoded       = "^0.6"
-futures                = "^0.1"
 tantivy                = "^0.10"
-tokio                  = "^0.1"
-tokio-signal           = "^0.2"
+futures-preview        = "^0.3.0-alpha"
+tokio                  = { version = "^0.2.0-alpha", features = ["signal"] }
 config                 = "^0.9"
 failure                = "^0.1"
 num_cpus               = "^1"
@@ -40,13 +35,15 @@ crossbeam              = "^0.7"
 hashbrown              = "^0.6"
 parking_lot            = "^0.9"
 tracing                = "^0.1"
-rand                   = { version = "^0.7", features = ["log"] }
+rand                   = { version = "^0.7", features = ["log", "small_rng"] }
 serde                  = { version = "^1.0", features = ["derive"] }
 clap                   = { version = "^2.3", features = ["color"] }
 uuid                   = { version = "^0.7", features = ["v4"] }
-tower-grpc             = { version = "^0.1", features = ["tower-hyper"] }
-tower-consul           = { git = "https://github.com/LucioFranco/tower-consul" }
-tracing-futures        = "0.0.1-alpha.1"
+tonic                  = "^0.1.0-alpha"
+tracing-futures        = { version = "^0.0.1-alpha", default-features = false, features = ["std-future"] }
+async-stream           = "^0.1"
+async-trait            = "^0.1"
+pin-utils              = "^0.1.0-alpha"
 tracing-log            = "^0.1"
 tracing-fmt            = "^0.1"
 
@@ -55,7 +52,6 @@ remove_dir_all = "^0.5"
 pretty_assertions = "^0.6"
 lazy_static = "^1.3"
 toshi-test = { path = "toshi-test" }
-
 
 [profile.release]
 opt-level = 3

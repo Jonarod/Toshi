@@ -8,7 +8,6 @@ use tantivy::query::{AllQuery, QueryParser};
 use tantivy::schema::*;
 use tantivy::space_usage::SearcherSpaceUsage;
 use tantivy::{Document, Index, IndexReader, IndexWriter, ReloadPolicy, Term};
-use tokio::prelude::*;
 use tracing::*;
 
 use crate::handlers::index::{AddDocument, DeleteDoc, DocsAffected};
@@ -16,22 +15,26 @@ use crate::query::{CreateQuery, KeyValue, Query, Search};
 use crate::results::{ScoredDoc, SearchResults};
 use crate::settings::Settings;
 use crate::{error::Error, Result};
+use async_trait::async_trait;
 
 pub enum IndexLocation {
     LOCAL,
     REMOTE,
 }
 
+#[async_trait]
+pub trait AsyncHandle {
+    async fn search_index(&self, search: Search) -> Result<SearchResults>;
+    async fn add_document(&self, doc: AddDocument) -> Result<()>;
+    async fn delete_term(&self, term: DeleteDoc) -> Result<DocsAffected>;
+}
 pub trait IndexHandle {
-    type SearchResponse: IntoFuture;
-    type DeleteResponse: IntoFuture;
-    type AddResponse: IntoFuture;
 
     fn get_name(&self) -> String;
     fn index_location(&self) -> IndexLocation;
-    fn search_index(&self, search: Search) -> Self::SearchResponse;
-    fn add_document(&self, doc: AddDocument) -> Self::AddResponse;
-    fn delete_term(&self, term: DeleteDoc) -> Self::DeleteResponse;
+    fn search_index(&self, search: Search) -> Result<SearchResults>;
+    fn add_document(&self, doc: AddDocument) -> Result<()>;
+    fn delete_term(&self, term: DeleteDoc) -> Result<DocsAffected>;
 }
 
 /// Index handle that operates on an Index local to the node, a remote index handle
@@ -75,10 +78,8 @@ impl Hash for LocalIndex {
     }
 }
 
+//#[async_trait]
 impl IndexHandle for LocalIndex {
-    type SearchResponse = Result<SearchResults>;
-    type DeleteResponse = Result<DocsAffected>;
-    type AddResponse = Result<()>;
 
     fn get_name(&self) -> String {
         self.name.clone()
@@ -88,7 +89,7 @@ impl IndexHandle for LocalIndex {
         IndexLocation::LOCAL
     }
 
-    fn search_index(&self, search: Search) -> Self::SearchResponse {
+    fn search_index(&self, search: Search) -> Result<SearchResults> {
         let searcher = self.reader.searcher();
         let schema = self.index.schema();
         let collector = TopDocs::with_limit(search.limit);
@@ -174,7 +175,7 @@ impl IndexHandle for LocalIndex {
         }
     }
 
-    fn add_document(&self, add_doc: AddDocument) -> Self::AddResponse {
+    fn add_document(&self, add_doc: AddDocument) -> Result<()> {
         let index_schema = self.index.schema();
         let writer_lock = self.get_writer();
         {
@@ -196,7 +197,7 @@ impl IndexHandle for LocalIndex {
         Ok(())
     }
 
-    fn delete_term(&self, term: DeleteDoc) -> Self::DeleteResponse {
+    fn delete_term(&self, term: DeleteDoc) -> Result<DocsAffected> {
         let index_schema = self.index.schema();
         let writer_lock = self.get_writer();
         let before: u64;

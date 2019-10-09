@@ -1,4 +1,3 @@
-use futures::Future;
 use http::Response;
 use hyper::Body;
 
@@ -10,5 +9,4 @@ pub mod root;
 pub mod search;
 pub mod summary;
 
-pub type BaseFuture = dyn Future<Item = Response<Body>, Error = hyper::Error> + Send;
-pub type ResponseFuture = Box<BaseFuture>;
+pub type ResponseFuture = Result<Response<Body>, hyper::Error>;

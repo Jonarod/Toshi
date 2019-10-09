@@ -6,8 +6,6 @@ use crossbeam::channel::{bounded, unbounded, Receiver, Sender};
 use serde::Deserialize;
 use tantivy::merge_policy::*;
 
-use crate::cluster::Consul;
-
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub const HEADER: &str = r#"
@@ -52,8 +50,6 @@ impl ConfigMergePolicy {
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct Experimental {
-    #[serde(default = "Settings::default_consul_addr")]
-    pub consul_addr: String,
     #[serde(default = "Settings::default_cluster_name")]
     pub cluster_name: String,
     #[serde(default = "Settings::default_master")]
@@ -65,7 +61,6 @@ pub struct Experimental {
 impl Default for Experimental {
     fn default() -> Self {
         Self {
-            consul_addr: Settings::default_consul_addr(),
             cluster_name: Settings::default_cluster_name(),
             master: Settings::default_master(),
             nodes: Settings::default_nodes(),
@@ -135,7 +130,6 @@ impl Settings {
 
     pub fn from_args(args: &ArgMatches) -> Self {
         let exper = Experimental {
-            consul_addr: args.value_of("consul-addr").unwrap().to_string(),
             cluster_name: args.value_of("cluster-name").unwrap().to_string(),
             master: args.value_of("master").unwrap().parse().unwrap(),
             nodes: args.values_of("nodes").unwrap().map(ToString::to_string).collect(),
@@ -239,13 +233,6 @@ impl Settings {
         } else {
             bounded::<T>(self.bulk_buffer_size)
         }
-    }
-
-    pub fn get_consul_client(&self) -> Consul {
-        Consul::builder()
-            .with_address(&self.experimental_features.consul_addr)
-            .build()
-            .expect("Unable to create consul client")
     }
 
     pub fn get_nodes(&self) -> Vec<String> {
